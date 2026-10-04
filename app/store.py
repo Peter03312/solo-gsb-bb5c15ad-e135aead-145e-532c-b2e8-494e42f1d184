@@ -8,6 +8,11 @@ from datetime import datetime, timezone
 from .routing import Rule, RuleSet, Target
 
 
+def utc_second_key(instant: datetime) -> str:
+    """把带时区的时刻转换为 UTC 秒级 ISO 字符串（与 created_at 列同形，可字典序比较）。"""
+    return instant.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
 class RevisionConflict(Exception):
     """所见修订号与当前修订号不一致（草稿或默认投递策略）。"""
 
@@ -381,3 +386,15 @@ def save_decision(
         ),
     )
     return get_decision(conn, delivery_id)
+
+
+# ---------- 历史投递核对报表（只读） ----------
+
+def max_decision_rowid(conn: sqlite3.Connection) -> int:
+    """当前已提交判定的边界：delivery_decisions 的最大 rowid（空表为 0）。
+
+    rowid 随插入单调递增；首次报表查询取此值后随翻页游标固化，
+    此后并发写入的新判定 rowid 更大，永不进入旧报表。
+    """
+    row = conn.execute("SELECT COALESCE(MAX(rowid), 0) AS boundary FROM delivery_decisions").fetchone()
+    return row["boundary"]

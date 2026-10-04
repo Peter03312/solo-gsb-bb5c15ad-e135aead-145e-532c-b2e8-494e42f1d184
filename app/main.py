@@ -4,9 +4,9 @@ from __future__ import annotations
 import sqlite3
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 
-from . import db, preview, store
+from . import db, preview, reports, store
 from .models import (
     DeliverRequest,
     DeliverySubmit,
@@ -449,3 +449,48 @@ def get_delivery(delivery_id: str) -> dict:
         "error": decision["error"],
         "created_at": decision["created_at"],
     }
+
+
+# ---------- 历史投递核对报表（带时区时间窗、可选策略修订、固定边界、键集分页） ----------
+
+@app.get("/delivery-reports")
+def get_delivery_report(
+    start: str = Query(description="时间窗起（含），带时区偏移的 ISO-8601 时刻"),
+    end: str = Query(description="时间窗止（不含），带时区偏移的 ISO-8601 时刻"),
+    policy_revision: int | None = Query(default=None, ge=1, description="可选：仅统计该策略修订号上受理的判定"),
+    page_size: str | None = Query(default=None, description=f"每页条数（1–{reports.MAX_PAGE_SIZE}，默认 {reports.DEFAULT_PAGE_SIZE}）"),
+    cursor: str | None = Query(default=None, description="上一页响应中的 next_cursor；携带后筛选与边界沿用首次查询"),
+) -> dict:
+    """核对历史投递判定：左闭右开时间窗 + 可选策略修订号。
+
+    首次查询固定“截至当时已提交判定”的边界（最大判定 rowid），并发新投递不进入旧报表；
+    返回按选中版本 / 分流侧 / 成功或失败原因分组的数量，以及按 rowid 键集分页的明细
+    （投递编号、规范化地址、策略修订号、选中版本、分流侧、状态 / 错误类型）。
+    分组总数与明细使用同一筛选与边界，翻页不漏不重。
+    无效时间窗、非法页大小、无效或与筛选不匹配的游标一律 422 明确拒绝。
+    """
+    # 自行解析页大小：非法值也返回与其他契约错误同形的 422 {"error": ...}
+    if page_size is None:
+        size = reports.DEFAULT_PAGE_SIZE
+    else:
+        try:
+            size = int(page_size)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "invalid_page_size", "page_size": page_size,
+                        "message": f"page_size must be an integer between 1 and {reports.MAX_PAGE_SIZE}"},
+            )
+    try:
+        with db.read_transaction() as conn:
+            return reports.run_report(
+                conn,
+                start_raw=start,
+                end_raw=end,
+                policy_revision=policy_revision,
+                page_size=size,
+                cursor_token=cursor,
+            )
+    except reports.ReportError as exc:
+        detail = {"error": exc.code, "message": str(exc), **exc.extra}
+        raise HTTPException(status_code=422, detail=detail)
