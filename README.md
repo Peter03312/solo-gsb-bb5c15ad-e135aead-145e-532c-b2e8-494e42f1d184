@@ -42,6 +42,13 @@
   相同编号 + 相同规范化地址的并发或后续请求**原样返回首次判定（含原错误状态）**，即使策略随后改变；
   编号相同而地址不同返回 409；**无效地址或未配置策略不占用编号**。
   `GET /deliveries/{id}` 可随时查询已持久化的判定。
+- **历史投递判定核对报表**：`GET /deliveries/report` 按**带时区的起止时刻（左闭右开）与可选策略
+  修订号**筛选已持久化的判定，返回按**选中版本 × 分流侧（基线/候选）× 结果（成功或失败原因）**
+  分组的数量，并分页列出投递编号、规范化地址、策略修订号、选中版本、分流侧与状态或错误类型；
+  已持久化的失败同样计入，同一编号只计一次。首次查询在单只读快照内固定**截至当时已提交判定的
+  边界**并随 `next_cursor` 返回；后续翻页只凭游标，沿用同一筛选与边界——并发新投递不进入旧报表，
+  分组总数与明细一致，页间不漏不重。空结果返回零计数与空页；无效时间窗、非法页大小、无效游标
+  均明确拒绝（422）。
 
 ## 一键启动（Docker Compose）
 
@@ -96,6 +103,7 @@ pytest tests/ -q                                   # 运行测试
 | PUT  | `/policy`         | 配置基线/候选版本与候选比例，需策略修订号 |
 | POST | `/deliver`        | 默认投递：按策略对收件地址稳定分桶解析 |
 | POST | `/deliveries`     | 幂等投递：投递编号 + 地址，首次判定持久化、重试原样返回 |
+| GET  | `/deliveries/report` | 历史判定核对报表：时间窗 + 分组计数 + 游标分页     |
 | GET  | `/deliveries/{id}` | 按投递编号查询已持久化的判定（含失败） |
 
 ## 调用示例
@@ -483,6 +491,80 @@ curl http://localhost:8000/deliveries/msg-2026-10-04-0001
 > 既有 `/deliver`、`/resolve` 的请求、响应与错误约定完全不变：`/deliver` 仍只做即时分桶解析，
 > 不产生持久化判定；需要强制指定版本复现时继续使用 `/resolve`。
 
+## 历史投递判定核对报表：时间窗 + 分组计数 + 游标分页
+
+运营核对历史投递判定用 `GET /deliveries/report`：按**带时区的起止时刻**（左闭右开
+`[start, end)`，作用于判定的受理时刻 `created_at`）与**可选策略修订号**筛选已持久化的判定，
+返回分组数量与分页明细。已持久化的失败判定同样计入；`delivery_id` 是主键，同一编号只计一次。
+
+### 11. 首次查询：固定筛选与快照边界
+
+```bash
+curl 'http://localhost:8000/deliveries/report?start=2026-10-01T00:00:00%2B08:00&end=2026-11-01T00:00:00%2B08:00&policy_revision=1&page_size=2'
+```
+
+- `start` / `end` 必填，必须是**带时区**的 ISO 8601 时刻（`Z` 或 `+08:00` 等偏移均可，
+  服务规范化为 UTC 后比较）；窗口**左闭右开**：恰好等于 `start` 的判定计入，恰好等于 `end` 的不计入。
+- `policy_revision` 可选：只核对某个策略修订号下受理的判定；缺省不过滤。
+- `page_size` 可选，默认 50，合法范围 1～500。
+
+```json
+{
+  "window": {"start": "2026-09-30T16:00:00+00:00", "end": "2026-10-31T16:00:00+00:00", "policy_revision": 1},
+  "page_size": 2,
+  "total": 4,
+  "groups": [
+    {"version": 1, "selection": "baseline",  "outcome": "ok",       "count": 1},
+    {"version": 2, "selection": "candidate", "outcome": "no_route", "count": 1},
+    {"version": 2, "selection": "candidate", "outcome": "ok",       "count": 1},
+    {"version": 2, "selection": "candidate", "outcome": "rejected", "count": 1}
+  ],
+  "items": [
+    {"delivery_id": "msg-0001", "address": "shared@corp.example.com", "policy_revision": 1,
+     "version": 2, "selection": "candidate", "status": "ok", "error_type": null,
+     "created_at": "2026-10-04T01:16:03+00:00"},
+    {"delivery_id": "msg-0002", "address": "blocked@corp.example.com", "policy_revision": 1,
+     "version": 2, "selection": "candidate", "status": "failed", "error_type": "rejected",
+     "created_at": "2026-10-04T01:16:03+00:00"}
+  ],
+  "next_cursor": "eyJ2IjoxLCJzdGFydCI6..."
+}
+```
+
+- `groups` 按**选中版本 × 分流侧（`baseline` / `candidate`）× 结果**分组计数：
+  成功为 `"outcome": "ok"`，失败为失败原因 `"rejected"` / `"no_route"` / `"cycle"`。
+- `items` 明细含投递编号、规范化地址、策略修订号、选中版本、分流侧与状态或错误类型
+  （`status` 为 `ok` / `failed`，`error_type` 仅失败时非空），按受理顺序排列。
+- `total` 为筛选下的判定总数，恒等于各组计数之和；`groups`、`total` 与全部页的明细
+  在**同一快照边界**上计算，三者必然一致。
+- 首次查询在单只读事务内固定“**截至当时已提交判定的边界**”；空结果返回
+  `"total": 0`、`"groups": []`、`"items": []`、`"next_cursor": null`。
+
+### 12. 后续翻页：只凭游标，沿用同一筛选与边界
+
+```bash
+curl 'http://localhost:8000/deliveries/report?cursor=eyJ2IjoxLCJzdGFydCI6...'
+# 翻页时允许调整页大小：...&page_size=100
+```
+
+- `next_cursor` 为 `null` 表示已到最后一页；否则凭它取下一页。
+- 游标已携带首次查询的筛选（起止时刻、策略修订号）与快照边界，**翻页时不要再传
+  `start` / `end` / `policy_revision`**（同传会被拒绝）；响应中的 `window` 回显实际沿用的筛选。
+- **并发新投递不进入旧报表**：首次查询之后受理的判定不会出现在该游标的任何后续页，
+  各页的 `groups` / `total` 也保持不变；要纳入新判定请重新发起首次查询。
+- 页间按唯一单调的内部序号键集分页：不漏记、不重复；各页明细拼接即为完整筛选结果。
+
+### 13. 明确拒绝（422）
+
+| 场景 | 响应 |
+| ---- | ---- |
+| 缺 `start` / `end`、不带时区、无法解析、`start >= end` | `{"error": "invalid_time_window", ...}` |
+| `page_size` 超出 1～500 | `{"error": "invalid_page_size", ...}` |
+| 游标无法解码、形状 / 版本不符、与筛选参数同传 | `{"error": "invalid_cursor", ...}` |
+
+> 该报表只读取已持久化的判定，不改动任何数据；`POST /deliveries` 的幂等判定、
+> `GET /deliveries/{id}` 的按编号查询与原样重放语义完全不变。
+
 ## 项目结构
 
 ```
@@ -492,9 +574,10 @@ app/
   routing.py   # 地址校验、规则集、逐跳解析、发布前全量校验
   traffic.py   # 默认投递的稳定分桶：规范化地址 → 0–99 桶 → 基线/候选
   preview.py   # 发布前预览：草稿 vs 基线版本的投递差异对比（纯内存，不落库）
+  reporting.py # 核对报表：带时区时间窗（左闭右开）校验、页大小校验、翻页游标编解码
   models.py    # 请求模型与编辑期校验（无效地址/重复规则/空目标/按键合并操作组）
-  store.py     # 草稿、修订快照、发布版本、默认投递策略与幂等投递判定的持久化、修订号核对与按键合并
-  main.py      # FastAPI 路由（/draft、/draft/changes、/resolve、/preview、/policy、/deliver、/deliveries 等）
-tests/         # pytest：API 全流程 + 解析单元测试 + 发布前预览 + 灰度策略 + 幂等投递判定 + 按键合并与修订快照
+  store.py     # 草稿、修订快照、发布版本、默认投递策略、幂等投递判定与核对报表的持久化与查询
+  main.py      # FastAPI 路由（/draft、/draft/changes、/resolve、/preview、/policy、/deliver、/deliveries、/deliveries/report 等）
+tests/         # pytest：API 全流程 + 解析单元测试 + 发布前预览 + 灰度策略 + 幂等投递判定 + 按键合并与修订快照 + 核对报表
 Dockerfile / docker-compose.yml
 ```

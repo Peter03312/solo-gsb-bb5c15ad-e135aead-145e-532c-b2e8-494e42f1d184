@@ -1,12 +1,12 @@
-"""HTTP API：草稿编辑（乐观锁）、发布（原子校验 + 不可变版本）、按版本解析、发布前预览、默认投递策略、幂等投递判定。"""
+"""HTTP API：草稿编辑（乐观锁）、发布（原子校验 + 不可变版本）、按版本解析、发布前预览、默认投递策略、幂等投递判定、历史判定核对报表。"""
 from __future__ import annotations
 
 import sqlite3
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 
-from . import db, preview, store
+from . import db, preview, reporting, store
 from .models import (
     DeliverRequest,
     DeliverySubmit,
@@ -426,6 +426,86 @@ def submit_delivery(body: DeliverySubmit) -> dict:
     if decision["status"] == "failed":  # 首次失败与重放都返回原错误状态
         raise HTTPException(status_code=422, detail=decision["error"])
     return _decision_doc(decision)
+
+
+# ---------- 历史投递判定核对报表（时间窗 + 分组计数 + 游标分页） ----------
+
+_REPORT_ITEM_FIELDS = (
+    "delivery_id", "address", "policy_revision", "version",
+    "selection", "status", "error_type", "created_at",
+)
+
+
+@app.get("/deliveries/report")
+def delivery_report(
+    start: str | None = None,
+    end: str | None = None,
+    policy_revision: int | None = Query(default=None, ge=0),
+    page_size: int | None = None,
+    cursor: str | None = None,
+) -> dict:
+    """按带时区的起止时刻（左闭右开）与可选策略修订号核对历史投递判定。
+
+    返回按选中版本、分流侧（基线/候选）、结果（ok 或失败原因）分组的数量，
+    并分页列出判定明细；已持久化的失败判定同样计入，同一编号只计一次。
+    首次查询在单只读事务内固定“截至当时已提交判定”的边界并随 next_cursor 返回；
+    后续翻页只凭 cursor（不再携带 start/end/policy_revision），沿用同一筛选与边界，
+    并发新投递不会进入旧报表，分组总数与明细一致，页间不漏不重。
+    无效时间窗（invalid_time_window）、非法页大小（invalid_page_size）、
+    无效游标（invalid_cursor）均返回 422。
+    """
+    try:
+        size = reporting.validate_page_size(page_size)
+        if cursor is not None:  # 翻页：筛选与边界全部由游标携带，不允许再传筛选参数
+            if start is not None or end is not None or policy_revision is not None:
+                raise reporting.ReportQueryError(
+                    "invalid_cursor",
+                    "cursor already carries the filter and snapshot boundary; "
+                    "do not pass start/end/policy_revision together with it",
+                )
+            state = reporting.decode_cursor(cursor)
+            window = (state.start, state.end, state.policy_revision)
+            snapshot_seq, after_seq = state.snapshot_seq, state.after_seq
+        else:  # 首次查询：校验时间窗，边界在下面的只读事务内固定
+            window = (*reporting.parse_time_window(start, end), policy_revision)
+            snapshot_seq, after_seq = None, 0
+        with db.read_transaction() as conn:
+            if snapshot_seq is None:
+                snapshot_seq = store.report_snapshot_seq(conn)
+            w_start, w_end, w_policy = window
+            groups = store.report_groups(
+                conn, start=w_start, end=w_end,
+                policy_revision=w_policy, snapshot_seq=snapshot_seq,
+            )
+            total = store.report_total(
+                conn, start=w_start, end=w_end,
+                policy_revision=w_policy, snapshot_seq=snapshot_seq,
+            )
+            rows = store.report_items(
+                conn, start=w_start, end=w_end,
+                policy_revision=w_policy, snapshot_seq=snapshot_seq,
+                after_seq=after_seq, limit=size + 1,  # 多取一条判断是否还有下一页
+            )
+    except reporting.ReportQueryError as exc:
+        raise HTTPException(status_code=422, detail={"error": exc.code, "message": exc.message})
+
+    page = rows[:size]
+    next_cursor = None
+    if len(rows) > size:  # 还有后续页：把同一筛选、同一边界与页位置编码进游标
+        next_cursor = reporting.encode_cursor(
+            reporting.ReportCursor(
+                start=w_start, end=w_end, policy_revision=w_policy,
+                snapshot_seq=snapshot_seq, after_seq=page[-1]["seq"],
+            )
+        )
+    return {
+        "window": {"start": w_start, "end": w_end, "policy_revision": w_policy},
+        "page_size": size,
+        "total": total,
+        "groups": groups,
+        "items": [{k: item[k] for k in _REPORT_ITEM_FIELDS} for item in page],
+        "next_cursor": next_cursor,
+    }
 
 
 @app.get("/deliveries/{delivery_id}")

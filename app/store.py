@@ -1,4 +1,4 @@
-"""持久层：草稿（带乐观锁修订号、按键合并与修订快照）、不可变发布版本、默认投递策略（基线/候选灰度）与幂等投递判定。"""
+"""持久层：草稿（带乐观锁修订号、按键合并与修订快照）、不可变发布版本、默认投递策略（基线/候选灰度）、幂等投递判定与历史判定核对报表。"""
 from __future__ import annotations
 
 import json
@@ -381,3 +381,100 @@ def save_decision(
         ),
     )
     return get_decision(conn, delivery_id)
+
+
+# ---------- 历史投递判定核对报表（时间窗 + 快照边界 + 分组计数 + 键集分页） ----------
+#
+# 报表在 delivery_decisions 的 rowid（随提交单调递增的内部序号）上固定边界：
+# 首次查询记下当时的最大序号，分组、总数与全部翻页都只看序号不超过该边界的判定，
+# 因此并发新投递不会进入旧报表；按 rowid 键集分页（唯一、单调）保证页间不漏不重。
+# delivery_id 是主键，同一编号天然只计一次；已持久化的失败判定同样计入。
+
+def _report_where(
+    start: str,
+    end: str,
+    policy_revision: int | None,
+    snapshot_seq: int,
+    after_seq: int = 0,
+) -> tuple[str, list]:
+    """报表共用的筛选：同一快照边界 + 左闭右开时间窗（+ 可选策略修订号 + 分页下界）。"""
+    clause = "rowid <= ? AND rowid > ? AND created_at >= ? AND created_at < ?"
+    params: list = [snapshot_seq, after_seq, start, end]
+    if policy_revision is not None:
+        clause += " AND policy_revision = ?"
+        params.append(policy_revision)
+    return clause, params
+
+
+def report_snapshot_seq(conn: sqlite3.Connection) -> int:
+    """截至当前已提交判定的内部序号上界；报表以此固定边界，之后的新投递不进入该报表。"""
+    row = conn.execute("SELECT COALESCE(MAX(rowid), 0) AS seq FROM delivery_decisions").fetchone()
+    return row["seq"]
+
+
+def report_groups(
+    conn: sqlite3.Connection,
+    *,
+    start: str,
+    end: str,
+    policy_revision: int | None,
+    snapshot_seq: int,
+) -> list[dict]:
+    """按选中版本、分流侧（基线/候选）、结果（ok 或失败原因）分组计数。"""
+    clause, params = _report_where(start, end, policy_revision, snapshot_seq)
+    rows = conn.execute(
+        f"""
+        SELECT version, selection,
+               CASE WHEN status = 'ok' THEN 'ok' ELSE json_extract(error, '$.error') END AS outcome,
+               COUNT(*) AS count
+        FROM delivery_decisions
+        WHERE {clause}
+        GROUP BY version, selection, outcome
+        ORDER BY version, selection, outcome
+        """,
+        params,
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def report_total(
+    conn: sqlite3.Connection,
+    *,
+    start: str,
+    end: str,
+    policy_revision: int | None,
+    snapshot_seq: int,
+) -> int:
+    """与分组同一筛选下的判定总数（恒等于各组计数之和）。"""
+    clause, params = _report_where(start, end, policy_revision, snapshot_seq)
+    row = conn.execute(
+        f"SELECT COUNT(*) AS n FROM delivery_decisions WHERE {clause}", params
+    ).fetchone()
+    return row["n"]
+
+
+def report_items(
+    conn: sqlite3.Connection,
+    *,
+    start: str,
+    end: str,
+    policy_revision: int | None,
+    snapshot_seq: int,
+    after_seq: int,
+    limit: int,
+) -> list[dict]:
+    """取一页判定明细（按内部序号升序，从 after_seq 之后继续，最多 limit 条）。"""
+    clause, params = _report_where(start, end, policy_revision, snapshot_seq, after_seq)
+    rows = conn.execute(
+        f"""
+        SELECT rowid AS seq, delivery_id, address, policy_revision, version, selection, status,
+               CASE WHEN status = 'ok' THEN NULL ELSE json_extract(error, '$.error') END AS error_type,
+               created_at
+        FROM delivery_decisions
+        WHERE {clause}
+        ORDER BY rowid
+        LIMIT ?
+        """,
+        [*params, limit],
+    ).fetchall()
+    return [dict(r) for r in rows]
